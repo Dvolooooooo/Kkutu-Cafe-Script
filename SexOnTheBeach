@@ -215,13 +215,47 @@ end
 -- ============================================================
 -- [ WindUI 라이브러리 로드 ]
 -- 깃허브에서 코드를 받아오는 과정이라 네트워크 상태에 따라 실패할 수 있습니다.
--- 게다가 WindUI 내부 코드는 실행기가 writefile을 지원하지 않으면
--- ReplicatedStorage:WaitForChild("GetIcons", 99999):InvokeServer() 라는
--- 줄을 실행하는데, 이 게임에는 그런 리모트가 없어서 최대 99999초(약 27시간)
--- 동안 그 자리에서 영원히 멈춰버립니다 — 이게 "UI가 아예 안 뜨는" 진짜 원인
--- 이었습니다. 그래서 로드를 별도 스레드에서 돌리고, 일정 시간 안에 끝나지
--- 않으면 시간 초과로 보고 다음 시도로 넘어가도록 감시합니다.
+--
+-- [ 무한로딩 근본 원인 ]
+-- WindUI 내부와, WindUI가 자동으로 불러오는 아이콘 모듈(Icons/Main-v2.lua)
+-- 안에는 "진짜 익스플로잇 실행기가 맞는지"를 판단해서 분기하는 코드가 있는데,
+-- 그 판단 기준이 되는 전역 함수(writefile, request)가 사용자의 실행기에
+-- 없으면(또는 실행기가 그 함수들을 지원 안 하면), "이 게임에는 존재하지
+-- 않는" 리모트(GetIcons/Loadstring/Request)를 WaitForChild(..., 9999~99999)
+-- 로 무한대기하는 코드 경로를 타버립니다. 리모트가 영원히 안 생기니
+-- WaitForChild가 영원히 안 끝나고, 그 뒤의 UI 생성 코드가 통째로 멈춥니다.
+--
+-- [ 해결 방법 ]
+-- WindUI를 부르기 "전에" 이 함수들이 없으면 안전한 더미 함수로 미리 채워
+-- 넣어서, WindUI/아이콘 모듈이 "정상적인 실행기다"라고 판단하게 만들어
+-- 애초에 그 위험한 무한대기 분기 자체를 타지 않도록 막습니다.
+-- (더미 request는 실제로 호출되지 않고 "존재하는지 여부"만 검사당하므로
+-- 안전합니다. writefile 계열 더미는 실제 파일 저장은 안 되지만 최소한
+-- 멈추지는 않습니다.)
+-- 그래도 혹시 모를 상황을 대비해 타임아웃 감시 + 재시도는 유지합니다.
 -- ============================================================
+if not request then
+    request = function(opts) return { Success = false, StatusCode = 0, Body = "" } end
+end
+if not writefile then
+    writefile = function(path, data) end
+end
+if not readfile then
+    readfile = function(path) return "" end
+end
+if not isfile then
+    isfile = function(path) return false end
+end
+if not isfolder then
+    isfolder = function(path) return true end
+end
+if not makefolder then
+    makefolder = function(path) end
+end
+if not delfile then
+    delfile = function(path) end
+end
+
 local WindUI = nil
 do
     local WINDUI_URL = "https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"
@@ -255,7 +289,7 @@ do
         end
 
         if not finished then
-            lastErr = "시간 초과(" .. WINDUI_LOAD_TIMEOUT .. "초) - WindUI 내부 코드가 존재하지 않는 리모트를 무한 대기했을 가능성이 있음"
+            lastErr = "시간 초과(" .. WINDUI_LOAD_TIMEOUT .. "초) - 무한대기 지뢰를 밟았을 가능성이 있음"
         else
             lastErr = loadResult
         end
@@ -703,6 +737,7 @@ local raceNodes = {}
 local raceLabelCache = nil
 local raceRankCache = nil
 local raceOutCache = {}
+local raceEdgeCache = {} -- findRaceWord()의 글자별 분류/정렬 결과 캐시 (성능 최적화)
 local RACE_DATA_BASE = "https://gist.githubusercontent.com/GUMI2029/fecbfae5a7d44423a882002df65de3d2/raw"
 local RACE_CACHE_VERSION = "20260704_race_auto"
 
@@ -937,58 +972,73 @@ end
 local function findRaceWord(letter, openingSafe)
     raceBuildGraph()
     local label, rank = raceRelabel()
-    local kill, yudo, safe, risk = {}, {}, {}, {}
-    local checked = {}
 
-    for _, cs in ipairs(getDuumVariants(letter)) do
-        if not checked[cs] then
-            checked[cs] = true
-            local row = raceCount[cs]
-            if row then
-                for ce, cnt in pairs(row) do
-                    if cnt and cnt > 0 then
-                        local e = {cs = cs, ce = ce, reply = raceOutCapacity(ce), rank = rank[ce] or 999999}
-                        if openingSafe and e.reply < RACE_OPEN_MIN_OPP then
-                            -- 첫 턴: 착지 자리에 응수가 너무 적으면 후보 제외
-                        elseif (not openingSafe) and e.reply <= 0 then
-                            table.insert(kill, e)
-                        elseif label[ce] == "L" then
-                            if not openingSafe then
-                                table.insert(yudo, e)
+    -- 성능 최적화: 같은 글자(+openingSafe 상태)에 대한 분류/정렬 결과를
+    -- 캐싱해서, 재시도 루프에서 반복 호출될 때마다 매번 다시 계산하지
+    -- 않도록 합니다. (이게 없으면 노멀모드에서 랙이 심하게 걸림)
+    local cacheKey = letter .. "|" .. tostring(openingSafe)
+    local cached = raceEdgeCache[cacheKey]
+
+    local kill, yudo, safe, risk
+    if cached then
+        kill, yudo, safe, risk = cached.kill, cached.yudo, cached.safe, cached.risk
+    else
+        kill, yudo, safe, risk = {}, {}, {}, {}
+        local checked = {}
+
+        for _, cs in ipairs(getDuumVariants(letter)) do
+            if not checked[cs] then
+                checked[cs] = true
+                local row = raceCount[cs]
+                if row then
+                    for ce, cnt in pairs(row) do
+                        if cnt and cnt > 0 then
+                            local e = {cs = cs, ce = ce, reply = raceOutCapacity(ce), rank = rank[ce] or 999999}
+                            if openingSafe and e.reply < RACE_OPEN_MIN_OPP then
+                                -- 첫 턴: 착지 자리에 응수가 너무 적으면 후보 제외
+                            elseif (not openingSafe) and e.reply <= 0 then
+                                table.insert(kill, e)
+                            elseif label[ce] == "L" then
+                                if not openingSafe then
+                                    table.insert(yudo, e)
+                                end
+                            elseif label[ce] == "W" then
+                                table.insert(risk, e)
+                            else
+                                table.insert(safe, e)
                             end
-                        elseif label[ce] == "W" then
-                            table.insert(risk, e)
-                        else
-                            table.insert(safe, e)
                         end
                     end
                 end
             end
         end
+
+        table.sort(kill, function(a, b) return a.reply < b.reply end)
+        table.sort(yudo, function(a, b)
+            if a.rank ~= b.rank then return a.rank < b.rank end
+            return a.reply < b.reply
+        end)
+        table.sort(safe, function(a, b)
+            if a.reply ~= b.reply then return a.reply < b.reply end
+            return a.ce < b.ce
+        end)
+        table.sort(risk, function(a, b)
+            if a.rank ~= b.rank then return a.rank > b.rank end
+            return a.reply < b.reply
+        end)
+
+        raceEdgeCache[cacheKey] = {kill = kill, yudo = yudo, safe = safe, risk = risk}
     end
 
-    table.sort(kill, function(a, b) return a.reply < b.reply end)
     local w = racePickEdgeWord(letter, kill, openingSafe)
     if w then return w end
 
-    table.sort(yudo, function(a, b)
-        if a.rank ~= b.rank then return a.rank < b.rank end
-        return a.reply < b.reply
-    end)
     w = racePickEdgeWord(letter, yudo, openingSafe)
     if w then return w end
 
-    table.sort(safe, function(a, b)
-        if a.reply ~= b.reply then return a.reply < b.reply end
-        return a.ce < b.ce
-    end)
     w = racePickEdgeWord(letter, safe, openingSafe)
     if w then return w end
 
-    table.sort(risk, function(a, b)
-        if a.rank ~= b.rank then return a.rank > b.rank end
-        return a.reply < b.reply
-    end)
     w = racePickEdgeWord(letter, risk, openingSafe)
     if w then return w end
 
@@ -1041,17 +1091,34 @@ end
 
 -- ============================================================
 -- [ 제출 ]
--- 1) 첫 단어를 내고 0.1초 기다려서 스코어보드 이름이 바뀌었는지 확인합니다.
--- 2) 0.1초 안에 안 바뀌면(=거부) 그때부터 0.001초 간격으로 최대 20번
---    엄청 빠르게 다른 단어로 재시도합니다. (랙 방지를 위해 재시도 횟수 축소)
--- 3) 그래도 다 실패하면, 너무 많은 단어가 영구히 못 쓰게 되는 걸 막기 위해
---    이번에 시도했던 단어 중 19개는 다시 쓸 수 있게 풀어줍니다.
+-- 노멀 모드: 단어 1개만 생성해서 리모트를 딱 1번만 쏘고 끝냅니다.
+--            (거부 감지/재시도 로직 없음)
+-- 긴단어 모드: 기존처럼 거부 감지 + 초고속 재시도 로직을 그대로 사용합니다.
+--   1) 첫 단어를 내고 0.1초 기다려서 스코어보드 이름이 바뀌었는지 확인
+--   2) 0.1초 안에 안 바뀌면(=거부) 0.001초 간격으로 최대 20번 재시도
+--   3) 그래도 다 실패하면 시도했던 단어 중 19개는 다시 쓸 수 있게 풀어줌
+--
+-- 단어 딜레이: 최소값~최대값 사이에서 매번 무작위로 하나 골라서 그만큼
+-- 기다린 뒤 제출합니다. 최소/최대가 비어있거나 둘 다 0이면 딜레이 없이
+-- 거의 즉시 제출합니다.
 -- ============================================================
-local FIRST_CHECK_DELAY = 0.1     -- 첫 제출 후 변경 여부를 확인하는 대기시간(초)
-local MAX_SUBMIT_RETRY = 20       -- 거부됐을 때 빠르게 재시도할 최대 횟수
-local FAST_RETRY_DELAY = 0.001    -- 빠른 재시도 간격(초)
-local RESET_COUNT_ON_FAIL = 19    -- 재시도를 다 썼을 때 다시 풀어줄 단어 개수
-local wordDelay = 0 -- 상대가 단어를 낸 뒤 내가 답하기까지의 딜레이(초). 0이면 거의 즉시 응답
+local FIRST_CHECK_DELAY = 0.1     -- 첫 제출 후 변경 여부를 확인하는 대기시간(초, 긴단어 모드 전용)
+local MAX_SUBMIT_RETRY = 20       -- 거부됐을 때 빠르게 재시도할 최대 횟수(긴단어 모드 전용)
+local FAST_RETRY_DELAY = 0.001    -- 빠른 재시도 간격(초, 긴단어 모드 전용)
+local RESET_COUNT_ON_FAIL = 19    -- 재시도를 다 썼을 때 다시 풀어줄 단어 개수(긴단어 모드 전용)
+local wordDelayMin = 0 -- 단어 딜레이 최소값(초). 비어있거나 0이면 딜레이 없음
+local wordDelayMax = 0 -- 단어 딜레이 최대값(초). 비어있거나 0이면 딜레이 없음
+
+local function getWordDelay()
+    local mn = tonumber(wordDelayMin) or 0
+    local mx = tonumber(wordDelayMax) or 0
+    if mn <= 0 and mx <= 0 then return 0 end
+    if mn < 0 then mn = 0 end
+    if mx < 0 then mx = 0 end
+    if mn > mx then mn, mx = mx, mn end
+    if mn == mx then return mn end
+    return mn + math.random() * (mx - mn)
+end
 
 local function submitWord(word, skip)
     local sent = fireSubmitWord(word)
@@ -1063,8 +1130,9 @@ end
 
 local function doAutoInput()
     local success, err = pcall(function()
-        if wordDelay and wordDelay > 0 then
-            task.wait(wordDelay)
+        local delay = getWordDelay()
+        if delay > 0 then
+            task.wait(delay)
         end
 
         local main, alt = readTurnLetters()
@@ -1073,6 +1141,16 @@ local function doAutoInput()
         end
         lastStartChar = main
 
+        -- 노멀 모드: 단어 1개 생성해서 딱 1번만 제출하고 끝
+        if mode == "NORMAL" then
+            local word = generateWord(main, alt)
+            if word then
+                submitWord(word, true)
+            end
+            return
+        end
+
+        -- 긴단어 모드(및 그 외 모드): 거부 감지 + 초고속 재시도 로직
         local beforeName = getScoreboardTurnName()
         local attemptedWords = {}
         local matched = false
@@ -1268,7 +1346,7 @@ speedTab:Section({ Title = "제출 방식" })
 pcall(function()
     speedTab:Paragraph({
         Title = "안내",
-        Desc = "먼저 단어를 내고 0.1초 기다려서 바뀌는지 확인합니다. 0.1초 안에 안 바뀌면(거부) 그때부터 0.001초 간격으로 최대 20번 초고속 재시도하고, 그래도 실패하면 시도했던 단어 중 19개를 다시 쓸 수 있게 풀어줍니다.",
+        Desc = "노멀 모드: 단어 1개를 만들어서 리모트를 딱 1번만 쏩니다(재시도 없음).\n긴단어 모드: 먼저 단어를 내고 0.1초 기다려서 바뀌는지 확인합니다. 0.1초 안에 안 바뀌면(거부) 그때부터 0.001초 간격으로 최대 20번 초고속 재시도하고, 그래도 실패하면 시도했던 단어 중 19개를 다시 쓸 수 있게 풀어줍니다.",
     })
 end)
 
@@ -1277,17 +1355,31 @@ speedTab:Section({ Title = "단어 딜레이" })
 pcall(function()
     speedTab:Paragraph({
         Title = "설명",
-        Desc = "상대가 단어를 내고 나서 내가 답을 내기까지 기다리는 시간입니다. 0으로 두면 거의 0초만에 바로 받아칩니다.",
+        Desc = "상대가 단어를 내고 나서 내가 답을 내기까지 기다리는 시간을 최소~최대 범위로 정합니다(매번 그 사이 랜덤 값 적용). 비어있거나 둘 다 0이면 딜레이 없이 거의 즉시 응답합니다.",
     })
 end)
 
-speedTab:Slider({
-    Title = "단어 딜레이 (초)",
-    Desc = "0 = 거의 즉시 응답 · 값이 클수록 사람처럼 살짝 늦게 응답",
-    Step = 0.1,
-    Value = {Min = 0, Max = 3, Default = 0},
+speedTab:Input({
+    Title = "딜레이 최소값 (초)",
+    Placeholder = "기본값: 0",
     Callback = function(v)
-        wordDelay = tonumber(v) or 0
+        if v == nil or v == "" then
+            wordDelayMin = 0
+        else
+            wordDelayMin = tonumber(v) or 0
+        end
+    end,
+})
+
+speedTab:Input({
+    Title = "딜레이 최대값 (초)",
+    Placeholder = "기본값: 0",
+    Callback = function(v)
+        if v == nil or v == "" then
+            wordDelayMax = 0
+        else
+            wordDelayMax = tonumber(v) or 0
+        end
     end,
 })
 
@@ -1448,6 +1540,8 @@ etcTab:Toggle({
     end,
 })
 
+
+
 -- ══════════════════════════════════════
 -- 단어 로드 & 게임 루프
 -- ══════════════════════════════════════
@@ -1538,3 +1632,4 @@ task.spawn(function()
         end
     end
 end)
+
