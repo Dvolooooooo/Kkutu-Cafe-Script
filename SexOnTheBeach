@@ -1,6 +1,7 @@
 -- ============================================================
 -- 끝말잇기 자동화 스크립트 (WindUI 전용 신버전)
--- KkutuHUD.TurnLetter / KkutuRemotes.SubmitWord 리모트 구조 대응판
+-- KkutuHUD.TurnLetter / KkutuRemotes.SubmitWord / RequestDictionarySearch
+-- 리모트 구조 대응판 (게임 사전 검색 리모트 기반 - HTTP 단어 로드 없음)
 -- ============================================================
 
 local UserInputService = game:GetService("UserInputService")
@@ -10,6 +11,7 @@ local player = Players.LocalPlayer
 
 -- ============================================================
 -- [ 단어 삭제 목록 ]
+-- 여기에 등록한 단어는 검색 결과에 있어도 제출 후보에서 제외합니다.
 -- ============================================================
 local DELETE_WORDS_FILE = "끝말봇_삭제단어.txt"
 local deletedWords = {}
@@ -27,84 +29,11 @@ local function isDeleted(word)
     return deletedWords[word] == true
 end
 
--- ============================================================
--- [ 끄투 단어목록 사용 여부 (하나로 묶은 ON/OFF) ]
--- 끄투 필수공격/공격/방어/단어목록 4개를 하나의 스위치로 묶어서 켜고 끕니다.
--- OFF로 바꾸면 재로드 없이 즉시 그 단어들을 전혀 쓸 수 없게 되고,
--- 다시 ON으로 바꾸면 즉시 원래대로 사용 가능해집니다.
--- ============================================================
-local kkutuWordsEnabled = true      -- 기본값: 켜짐
-local kkutuWordSet = {}             -- 끄투 4개 출처에서 온 단어들의 집합 (사전 로드 시 채워짐)
-
--- 지금 이 단어를 쓸 수 없는 상태인지: 끄투 출처 단어인데 마스터 스위치가 꺼져있으면 true
-local function isKkutuDisabled(word)
-    if kkutuWordsEnabled then return false end
-    return kkutuWordSet[word] == true
-end
-
 local function saveDeletedWords()
     local list = {}
     for w, _ in pairs(deletedWords) do table.insert(list, w) end
     pcall(function() writefile(DELETE_WORDS_FILE, table.concat(list, "\n")) end)
 end
-
--- ============================================================
--- [ 첫턴끝말 블랙리스트 ]
--- 여기에 등록한 "끝 글자"로 끝나는 단어는 내가 첫 턴(선공)일 때만 사용하지
--- 않습니다. 첫 턴이 아니면(중간 턴) 평소처럼 정상적으로 사용합니다.
--- 파일: 끝말봇_첫턴끝말블랙리스트.txt (한 줄에 한 글자씩 저장)
--- ============================================================
-local OPENER_ENDING_BLACKLIST_FILE = "끝말봇_첫턴끝말블랙리스트.txt"
-local openerEndingBlacklist = {}
-
-local function saveOpenerEndingBlacklist()
-    local list = {}
-    for ch, _ in pairs(openerEndingBlacklist) do table.insert(list, ch) end
-    pcall(function() writefile(OPENER_ENDING_BLACKLIST_FILE, table.concat(list, "\n")) end)
-end
-
-pcall(function()
-    if isfile and isfile(OPENER_ENDING_BLACKLIST_FILE) then
-        local content = readfile(OPENER_ENDING_BLACKLIST_FILE)
-        for ch in content:gmatch("[가-힣]") do
-            openerEndingBlacklist[ch] = true
-        end
-    end
-end)
-
-local function addOpenerEndingBlacklist(ch)
-    if type(ch) ~= "string" or ch == "" then return end
-    openerEndingBlacklist[ch] = true
-    saveOpenerEndingBlacklist()
-end
-
-local function removeOpenerEndingBlacklist(ch)
-    if type(ch) ~= "string" or ch == "" then return end
-    openerEndingBlacklist[ch] = nil
-    saveOpenerEndingBlacklist()
-end
-
--- ============================================================
--- [ 첫 턴(오프너) 안전장치 ]
--- 실전에서 "첫 턴 단어로 냈다가 서버에 거부당한" 사례들을 반영한 규칙.
--- 노멀모드(RACE 알고리즘)의 오프닝 안전구간에서만 적용됩니다.
--- ============================================================
-local OPENER_DEAD_START_LETTERS = {
-    ["륨"] = true,
-    ["늬"] = true,
-    ["쏄"] = true,
-}
-local OPENER_BAD_WORDS = {
-    ["자리맡"] = true,
-    ["마음탓"] = true,
-    ["시조필리움콤뮨"] = true,
-    ["기빱"] = true,
-    ["나슨"] = true,
-    ["마스껨"] = true,
-    ["마름모무늬"] = true,
-    ["사굠"] = true,
-}
-local RACE_OPEN_MIN_OPP = 3
 
 pcall(function()
     if CoreGui:FindFirstChild("끄글봇_WindUI") then
@@ -151,8 +80,6 @@ local function getScoreboardTurnName()
     if ok and type(name) == "string" then return name end
     return nil
 end
-
-
 
 -- TurnLetter 텍스트를 읽어옵니다. "리(이)" 처럼 괄호 병기 형태면 두 글자를
 -- 모두 반환합니다 (앞 글자, 괄호 안 글자). 괄호 문자 종류(반각/전각)나 공백에
@@ -210,6 +137,152 @@ local function fireSubmitWord(word)
         SUBMIT_ID = SUBMIT_ID + 1
     end
     return sentOk
+end
+
+-- ============================================================
+-- [ 끄투 단어목록 사용 여부 (사전 검색의 injeong 파라미터로 반영) ]
+-- ON이면 검색 리모트 호출 시 injeong=true(게임이 인정한 단어만),
+-- OFF면 injeong=false(인정 여부 무관)로 요청합니다.
+-- ============================================================
+local kkutuWordsEnabled = true -- 기본값: 켜짐
+
+-- ============================================================
+-- [ 사전 검색 리모트 ]
+-- game:GetService("ReplicatedStorage"):WaitForChild("KkutuRemotes")
+--     :WaitForChild("RequestDictionarySearch"):InvokeServer(unpack(args))
+-- args = {{ query = startChar, sort = sortMode, page = pageNum, injeong = kkutuWordsEnabled }}
+-- query에는 시작 글자만 그대로 넣습니다("?" 붙이지 않음).
+-- injeong은 끄투 단어목록 토글 상태를 그대로 반영합니다(끄투 켜짐=true →
+-- 인정 단어만, 꺼짐=false → 인정 여부 무관).
+-- 게임 UI처럼 hasMore가 true면 page를 1씩 늘려가며 계속 더 불러올 수
+-- 있습니다("스크롤해야 더 나오는" 것과 동일한 페이지네이션 방식).
+-- ============================================================
+
+-- startChar로 시작하는 단어들을 사전 검색 리모트에서 한 페이지 받아옵니다.
+-- 반환값: words(테이블 또는 nil), hasMore(boolean)
+-- 최적화: 캐시로 리모트 참조 재사용
+local _cachedRemotes = nil
+local _cachedSearchRemote = nil
+
+local function remoteSearchPage(startChar, sortMode, pageNum)
+    -- 캐시된 리모트 참조 사용 (없으면 처음에만 WaitForChild)
+    if not _cachedRemotes then
+        local ok, remotes = pcall(function()
+            return ReplicatedStorage:WaitForChild("KkutuRemotes", 5)
+        end)
+        if not ok or not remotes then return nil, false end
+        _cachedRemotes = remotes
+    end
+    
+    if not _cachedSearchRemote then
+        local okR, remote = pcall(function()
+            return _cachedRemotes:WaitForChild("RequestDictionarySearch", 5)
+        end)
+        if not okR or not remote then return nil, false end
+        _cachedSearchRemote = remote
+    end
+
+    local args = {
+        {
+            query = startChar,
+            sort = sortMode,
+            page = pageNum,
+            injeong = kkutuWordsEnabled,
+        }
+    }
+
+    local okI, result = pcall(function()
+        return _cachedSearchRemote:InvokeServer(unpack(args))
+    end)
+    if not okI or type(result) ~= "table" or not result.ok then return nil, false end
+    if type(result.words) ~= "table" then return nil, false end
+    return result.words, result.hasMore == true
+end
+
+-- ============================================================
+-- [ 점진적 페이지 로딩 방식 ]
+-- 한 번에 모든 페이지를 긁지 않고, "필요할 때만" 다음 페이지를 추가로 로드합니다.
+--
+-- 동작 방식:
+--   1. 처음에는 page 0만 검색
+--   2. page 0의 단어를 다 썼으면 → page 1 추가 로드 (page 0 결과는 캐시에 유지)
+--   3. page 1의 단어를 다 썼으면 → page 2 추가 로드
+--   4. "리셋" 버튼 → 모든 캐시 초기화 → 다시 page 0부터
+-- ============================================================
+
+local REMOTE_SEARCH_MAX_PAGES = 10
+
+-- 글자 + 정렬방식별 캐시 상태
+-- cacheWords[sortMode][startChar] = 누적된 단어 리스트 (table)
+-- cacheNextPage[sortMode][startChar] = 다음에 로드할 페이지 번호
+-- cacheExhausted[sortMode][startChar] = true면 더 이상 페이지 없음 (hasMore=false)
+local cacheWords = {}
+local cacheNextPage = {}
+local cacheExhausted = {}
+
+-- 특정 글자의 특정 페이지를 1회 로드
+-- "교체" 방식: 이전 페이지 캐시를 버리고 새 페이지로 교체
+-- 반환: 로드한 단어 수 (0이면 빈 페이지 or 실패)
+local function loadNextPage(startChar, sortMode)
+    -- 캐시 구조 초기화 (첫 호출 시)
+    if not cacheWords[sortMode] then
+        cacheWords[sortMode] = {}
+        cacheNextPage[sortMode] = {}
+        cacheExhausted[sortMode] = {}
+    end
+
+    -- 이미 더 이상 페이지가 없음이 확인됐으면 스킵
+    if cacheExhausted[sortMode][startChar] then return 0 end
+
+    local nextPage = cacheNextPage[sortMode][startChar] or 0
+    if nextPage >= REMOTE_SEARCH_MAX_PAGES then
+        cacheExhausted[sortMode][startChar] = true
+        return 0
+    end
+
+    local words, hasMore = remoteSearchPage(startChar, sortMode, nextPage)
+    cacheNextPage[sortMode][startChar] = nextPage + 1
+
+    -- 이전 페이지 캐시를 버리고 새 페이지로 교체
+    cacheWords[sortMode][startChar] = {}
+    local added = 0
+    if words and #words > 0 then
+        for _, w in ipairs(words) do
+            table.insert(cacheWords[sortMode][startChar], w)
+            added = added + 1
+        end
+    end
+
+    if not hasMore then
+        cacheExhausted[sortMode][startChar] = true
+    end
+
+    return added
+end
+
+-- 현재까지 로드된 단어들을 반환 (없으면 nil)
+local function getCurrentlyLoadedWords(startChar, sortMode)
+    if not cacheWords[sortMode] then return nil end
+    return cacheWords[sortMode][startChar]
+end
+
+-- 초기화: 특정 글자의 캐시를 비움 (리셋 버튼에서 사용)
+local function clearCharCache(startChar, sortMode)
+    if cacheWords[sortMode] then cacheWords[sortMode][startChar] = nil end
+    if cacheNextPage[sortMode] then cacheNextPage[sortMode][startChar] = nil end
+    if cacheExhausted[sortMode] then cacheExhausted[sortMode][startChar] = nil end
+end
+
+-- 시작 문자에 대해 최소 1페이지는 로드되어 있는지 보장
+local function ensureFirstPageLoaded(startChar, sortMode)
+    if not cacheWords[sortMode] then
+        cacheWords[sortMode] = {}
+        cacheNextPage[sortMode] = {}
+        cacheExhausted[sortMode] = {}
+    end
+    if cacheWords[sortMode][startChar] == nil and not cacheExhausted[sortMode][startChar] then
+        loadNextPage(startChar, sortMode)
+    end
 end
 
 -- ============================================================
@@ -301,43 +374,10 @@ do
     end
 end
 
-
--- isKkutu = true인 4개 항목은 WindUI "기타" 탭의 마스터 스위치 하나로
--- 한꺼번에 켜고 끌 수 있습니다. 그 외 항목은 항상 켜져 있는 기본 단어장입니다.
-local WORDS_URLS = {
-    {url = "https://raw.githubusercontent.com/Dvolooooooo/-/refs/heads/main/%EB%81%84%EA%B8%80%20%EA%B3%B5%EA%B2%A9%EB%8B%A8%EC%96%B4.txt",       priority = 2},
-    {url = "https://raw.githubusercontent.com/Dvolooooooo/-/refs/heads/main/%EB%81%84%EA%B8%80%ED%95%84%EC%88%98%EA%B3%B5%EA%B2%A9%EB%8B%A8%EC%96%B4.txt", priority = 1},
-    {url = "https://raw.githubusercontent.com/Dvolooooooo/-/refs/heads/main/%EB%81%84%EA%B8%80%EB%B0%A9%EC%96%B4%EB%8B%A8%EC%96%B4.txt",       priority = 3},
-    {url = "https://raw.githubusercontent.com/Dvolooooooo/-/refs/heads/main/%EB%81%84%EA%B8%80%EB%8B%A8%EC%96%B4%20%EB%AA%A9%EB%A1%9D.txt",       priority = 4},
-    {url = "https://raw.githubusercontent.com/Dvolooooooo/-/refs/heads/main/%EC%8B%A0%EC%97%9C%EB%A3%B0%20%ED%95%84%EC%88%98%EA%B3%B5%EA%B2%A9.txt",   priority = 1},
-    {url = "https://raw.githubusercontent.com/Dvolooooooo/-/refs/heads/main/%EC%8B%A0%EC%97%9C%EB%A3%B0%20%EA%B3%B5%EA%B2%A9%EB%8B%A8%EC%96%B4.txt",   priority = 2},
-    {url = "https://raw.githubusercontent.com/Dvolooooooo/-/refs/heads/main/%EC%8B%A0%EC%97%9C%EB%A3%B0%20%EB%B0%A9%EC%96%B4%EB%8B%A8%EC%96%B4.txt",   priority = 3},
-    {url = "https://raw.githubusercontent.com/Dvolooooooo/-/refs/heads/main/%EC%8B%A0%EC%97%9C%EB%A3%B0%20%EB%8B%A8%EC%96%B4%EB%AA%A9%EB%A1%9D.txt",   priority = 4},
-    {url = "https://raw.githubusercontent.com/Dvolooooooo/-/refs/heads/main/%EC%9A%B0%EB%A6%AC%EB%A7%90%EC%83%98%20%ED%95%84%EC%88%98%EA%B3%B5%EA%B2%A9.txt", priority = 1},
-    {url = "https://raw.githubusercontent.com/Dvolooooooo/-/refs/heads/main/%EC%9A%B0%EB%A6%AC%EB%A7%90%EC%83%98%20%EA%B3%B5%EA%B2%A9.txt",       priority = 2},
-    {url = "https://raw.githubusercontent.com/Dvolooooooo/-/refs/heads/main/%EC%9A%B0%EB%A6%AC%EB%A7%90%EC%83%98%20%EA%B3%B5%EA%B2%A92.txt",      priority = 2},
-    {url = "https://raw.githubusercontent.com/Dvolooooooo/-/refs/heads/main/%EC%9A%B0%EB%A6%AC%EB%A7%90%EC%83%98%20%EB%B0%A9%EC%96%B4.txt",       priority = 3},
-    {url = "https://raw.githubusercontent.com/Dvolooooooo/-/refs/heads/main/%EC%9A%B0%EB%A6%AC%EB%A7%90%EC%83%98%20%EB%8B%A8%EC%96%B4%EB%AA%A9%EB%A1%9D.txt", priority = 4},
-    {url = "https://raw.githubusercontent.com/Dvolooooooo/-/refs/heads/main/%EB%81%84%ED%88%AC%20%ED%95%84%EC%88%98%EA%B3%B5%EA%B2%A9.txt",       priority = 1, isKkutu = true, label = "끄투 필수공격"},
-    {url = "https://raw.githubusercontent.com/Dvolooooooo/-/refs/heads/main/%EB%81%84%ED%88%AC%20%EA%B3%B5%EA%B2%A9%EB%8B%A8%EC%96%B4.txt",       priority = 2, isKkutu = true, label = "끄투 공격단어"},
-    {url = "https://raw.githubusercontent.com/Dvolooooooo/-/refs/heads/main/%EB%81%84%ED%88%AC%20%EB%B0%A9%EC%96%B4%EB%8B%A8%EC%96%B4.txt",       priority = 3, isKkutu = true, label = "끄투 방어단어"},
-    {url = "https://raw.githubusercontent.com/Dvolooooooo/-/refs/heads/main/%EB%81%84%ED%88%AC%20%EB%8B%A8%EC%96%B4%EB%AA%A9%EB%A1%9D.txt",       priority = 4, isKkutu = true, label = "끄투 단어목록"},
-}
-
--- 전방 선언: 실제 구현은 파일 뒷부분(단어 로드 섹션)에 있고, WindUI 토글
--- 콜백에서 이 변수를 통해 호출합니다.
-local reloadDictionary = function() end
-
-
--- 한글 유틸
+-- ============================================================
+-- [ 한글 유틸 (두음법칙 변형 생성용) ]
+-- ============================================================
 local CHO = {"ㄱ","ㄲ","ㄴ","ㄷ","ㄸ","ㄹ","ㅁ","ㅂ","ㅃ","ㅅ","ㅆ","ㅇ","ㅈ","ㅉ","ㅊ","ㅋ","ㅌ","ㅍ","ㅎ"}
-local function getCho(char)
-    local code = utf8.codepoint(char)
-    if code >= 44032 and code <= 55203 then
-        return CHO[math.floor((code - 44032) / 588) + 1]
-    end
-    return char
-end
 local function getChoIndex(char)
     local code = utf8.codepoint(char)
     if code >= 44032 and code <= 55203 then return math.floor((code - 44032) / 588) end
@@ -359,6 +399,7 @@ end
 local N_TO_O = {[2]=true,[3]=true,[6]=true,[7]=true,[12]=true,[17]=true,[20]=true}
 local R_TO_O = {[2]=true,[3]=true,[4]=true,[6]=true,[7]=true,[12]=true,[16]=true,[17]=true,[20]=true}
 
+-- 두음법칙 변형 후보를 생성합니다 (예: "력" -> {"력", "역"})
 local function getDuumVariants(startChar)
     local ci = getChoIndex(startChar)
     local ji = getJungIndex(startChar)
@@ -390,47 +431,13 @@ local function validWord(word)
 end
 
 -- 상태 변수
-local mode = "NORMAL"
-local inputMode = "MOBILE"
+local mode = "LONG"  -- 기본: 긴단어 찾기
 local autoReply = false
 local isReplying = false
 local lastTurnLetterText = nil  -- TurnLetter 텍스트 변화 감지용 (이전 값 캐시)
 local lastStartChar = nil
 local usedWords = {}
-local turnCounter = 0
-local OPENING_SAFE_TURNS = 3 -- 내가 첫 턴이면 이 횟수만큼 한방/공격단어를 아낌
 local recentWords = {}
-local maxRoute = 2
-
--- 사전
-local dictionary = {}
-local essentialDictionary = {}
-local attackDictionary = {}
-local defDictionary = {}
-local normalDictionary = {}
-local essentialSet = {}
-local attackSet = {}
-local defSet = {}
-local killable = {}
-local wordScore = {}
-
-local function isOpeningSafePhase()
-    return turnCounter < (OPENING_SAFE_TURNS * 2)
-end
-
-local function isOpeningBlockedWord(word)
-    if not isOpeningSafePhase() then return false end
-    if openerEndingBlacklist[lastChar(word)] then return true end
-    local s = wordScore[word] or 0
-    return s >= 10000 or essentialSet[word] == true or attackSet[word] == true
-end
-
-local function hasWordStarting(char)
-    for _, v in ipairs(getDuumVariants(char)) do
-        if dictionary[v] and #dictionary[v] > 0 then return true end
-    end
-    return false
-end
 
 local function isUsed(word) return usedWords[word] == true end
 local function addRecent(word)
@@ -444,675 +451,310 @@ local function wasRecent(word)
     return false
 end
 
--- 단어 로드
--- 지원하는 원본 형식 2가지:
---   1) JSON 형식: "단어" 패턴이 큰따옴표로 감싸져 있음
---   2) 일반 텍스트: 줄바꿈으로 단어가 나열됨
---   3) "[글자]" 헤더 아래 "깊이 N : 단어, 단어, ..." 또는 "돌림 : 단어, ..."
---      형식 (끄투 필수공격/공격/방어 단어 파일). "깊이"/"돌림" 라벨 자체가
---      한글이라서 줄 전체를 스캔하면 안 되고, 콜론(:) 뒤의 단어 목록만
---      쉼표로 나눠서 정확히 추출해야 오염되지 않습니다.
-local function addWordToDict(wordSet, data, w)
-    if w == "" or wordSet[w] or isDeleted(w) or not validWord(w) then return false end
-    wordSet[w] = true
-    local f = firstChar(w)
-    dictionary[f] = dictionary[f] or {}
-    table.insert(dictionary[f], w)
-    if data.priority == 1 then
-        essentialDictionary[f] = essentialDictionary[f] or {}
-        table.insert(essentialDictionary[f], w)
-        essentialSet[w] = true
-    elseif data.priority == 2 then
-        attackDictionary[f] = attackDictionary[f] or {}
-        table.insert(attackDictionary[f], w)
-        attackSet[w] = true
-    elseif data.priority == 3 then
-        defDictionary[f] = defDictionary[f] or {}
-        table.insert(defDictionary[f], w)
-        defSet[w] = true
-    else
-        normalDictionary[f] = normalDictionary[f] or {}
-        table.insert(normalDictionary[f], w)
-    end
-    -- 끄투 계열 출처면 별도 집합에도 표시 (마스터 스위치 OFF 시 실시간으로 걸러내기 위함)
-    if data.isKkutu then
-        kkutuWordSet[w] = true
-    end
-    return true
-end
+-- ============================================================
+-- [ 긴단어 모드: 검색 리모트 결과 중 가장 긴 단어 선택 ]
+-- ============================================================
 
--- 끄투 4개 출처는 항상 사전에는 로드해두고(재로드 없이 즉시 ON/OFF 하기 위해),
--- 실제 사용 시점에 isKkutuDisabled()로 걸러냅니다. 그래서 여기서는 별도의
--- ON/OFF 필터링 없이 모든 WORDS_URLS를 그대로 로드합니다.
-local function loadWords()
-    dictionary = {}; essentialDictionary = {}; attackDictionary = {}
-    defDictionary = {}; normalDictionary = {}
-    essentialSet = {}; attackSet = {}; defSet = {}
-    killable = {}; wordScore = {}
-    kkutuWordSet = {}
-    local total = 0
-    local wordSet = {}
-
-    for _, data in ipairs(WORDS_URLS) do
-        local ok, con = pcall(function() return game:HttpGet(data.url) end)
-        if ok and type(con) == "string" then
-            -- 1) JSON 형식 파싱
-            for w in con:gmatch('"([^"]+)"') do
-                w = w:match("^%s*(.-)%s*$")
-                if addWordToDict(wordSet, data, w) then total = total + 1 end
-            end
-            -- 2) & 3) 줄 단위 파싱: "깊이 N : 단어들" / "돌림 : 단어들" 형식과
-            -- 일반 텍스트 줄 형식을 모두 처리
-            for line in con:gmatch("[^\r\n]+") do
-                if not line:find('"') and not line:match("^%[") then
-                    local afterColon = line:match("^%s*깊이%s*%d+%s*:%s*(.+)$")
-                        or line:match("^%s*돌림%s*:%s*(.+)$")
-                    if afterColon then
-                        -- 콜론 뒤 쉼표로 구분된 단어들만 추출 (라벨 오염 방지)
-                        for w in afterColon:gmatch("[^,]+") do
-                            w = w:match("^%s*(.-)%s*$")
-                            if addWordToDict(wordSet, data, w) then total = total + 1 end
-                        end
-                    else
-                        for w in line:gmatch("[가-힣]+") do
-                            if addWordToDict(wordSet, data, w) then total = total + 1 end
-                        end
-                    end
-                end
+-- entries(문자열 배열 또는 {word=...} 테이블 배열)에서 아직 안 쓴 것들 중
+-- 가장 긴 글자수를 만족하는 것들을 모은 뒤 순수 랜덤으로 하나 선택합니다.
+-- (정렬 순서에 의존하지 않고, 매번 같은 것만 나오는 것을 방지하기 위해 랜덤)
+-- validWord()로 한글 음절(가~힣)로만 이루어진 단어인지 검사해서 "?" 같은
+-- 특수문자가 섞인 항목은 걸러냅니다.
+-- expectedStartChar가 주어지면, 검색 리모트가 실제로 그 글자로 "시작하지
+-- 않는" 단어를 섞어서 줄 수도 있으므로(예: "기"를 검색했는데 "간"으로
+-- 시작하는 단어가 섞여 나오는 경우) 첫 글자가 정확히 일치하는지 다시
+-- 한 번 검증해서 걸러냅니다.
+local function pickLongestFromEntries(entries, expectedStartChar)
+    if not entries then return nil end
+    -- 단일 패스: 최대 길이 추적 + 동일 최대 길이 단어만 즉시 수집
+    local longest = {}
+    local maxLen = 0
+    for _, entry in ipairs(entries) do
+        local w = type(entry) == "table" and entry.word or entry
+        if type(w) == "string" and w ~= ""
+            and not isUsed(w) and not isDeleted(w)
+            and (not expectedStartChar or firstChar(w) == expectedStartChar) then
+            local l = utf8.len(w) or #w
+            if l > maxLen then
+                -- 새 최대 발견 → 이전 목록 버리고 이 단어부터 시작
+                maxLen = l
+                longest = {w}
+            elseif l == maxLen then
+                table.insert(longest, w)
             end
         end
-        task.wait()
     end
-    return total
+    if #longest == 0 then return nil end
+    return longest[math.random(1, #longest)]
 end
 
+-- 사전 검색 리모트 결과를 시작 글자별로 캐싱해서, 한 턴 안에서 재시도할
+-- 때마다 매번 검색 리모트를 다시 부르지 않도록 합니다(그게 느림의 원인).
+-- 검색은 딱 1번만 하고, 재시도는 이 캐시에서 다른 긴 단어를 뽑아 제출만
+-- 반복합니다. TurnLetter가 바뀌면(=새 턴 시작) 캐시를 비웁니다.
+local function clearRemoteSearchCache()
+    -- 모든 글자의 길이순(length) 캐시 초기화
+    cacheWords["length"] = {}
+    cacheNextPage["length"] = {}
+    cacheExhausted["length"] = {}
+end
 
--- 점수 계산
-local function calcScores()
-    killable = {}; wordScore = {}
-    for sc, wl in pairs(dictionary) do
-        for _, w in ipairs(wl) do
-            if not hasWordStarting(lastChar(w)) then
-                killable[sc] = true
+-- 사전 검색 리모트에서 가장 긴 단어를 찾습니다.
+-- 현재 로드된 페이지들에서 미사용 최장 단어를 찾고, 없으면 다음 페이지를
+-- 한 장씩 추가로 로드하면서 반복합니다. 모든 페이지를 다 썼거나 더 이상
+-- 페이지가 없으면 nil을 반환합니다.
+local function findLongestWordFromRemote(sc)
+    local SORT = "length"
+    local variants = getDuumVariants(sc)
+    
+    -- 1단계: 첫 번째 변형에 대해 최소 1페이지 보장
+    local primaryVariant = variants[1]
+    ensureFirstPageLoaded(primaryVariant, SORT)
+
+    -- 2단계: 현재 캐시에서 미사용 최장 단어 탐색
+    local function tryFindFromCache()
+        local words = getCurrentlyLoadedWords(primaryVariant, SORT)
+        return pickLongestFromEntries(words, primaryVariant)
+    end
+
+    local found = tryFindFromCache()
+    if found then return found end
+
+    -- 3단계: 단어를 못 찾았으면 (현재 페이지의 단어를 다 썼으면)
+    -- → 다음 페이지로 교체 (이전 페이지 캐시 버림)
+    local MAX_RETRY = REMOTE_SEARCH_MAX_PAGES
+    for _ = 1, MAX_RETRY do
+        -- 아직 고갈 안 됐으면 다음 페이지 로드
+        if cacheExhausted[SORT] and not cacheExhausted[SORT][primaryVariant] then
+            local added = loadNextPage(primaryVariant, SORT)
+            if added > 0 then
+                found = tryFindFromCache()
+                if found then return found end
+            end
+        else
+            break -- 더 이상 페이지 없음
+        end
+    end
+
+    -- 4단계: 첫 번째 변형에서 못 찾았으면 두 번째 변형 시도
+    if #variants > 1 then
+        local altVariant = variants[2]
+        ensureFirstPageLoaded(altVariant, SORT)
+        
+        local function tryFindFromCacheAlt()
+            local words = getCurrentlyLoadedWords(altVariant, SORT)
+            return pickLongestFromEntries(words, altVariant)
+        end
+        
+        found = tryFindFromCacheAlt()
+        if found then return found end
+        
+        for _ = 1, MAX_RETRY do
+            if cacheExhausted[SORT] and not cacheExhausted[SORT][altVariant] then
+                local added = loadNextPage(altVariant, SORT)
+                if added > 0 then
+                    found = tryFindFromCacheAlt()
+                    if found then return found end
+                end
+            else
                 break
             end
         end
     end
-    local function atkBonus(w)
-        if essentialSet[w] then return 500
-        elseif attackSet[w] then return 200
-        elseif defSet[w] then return 50
-        else return 0 end
-    end
-    for _, wl in pairs(dictionary) do
-        for _, w in ipairs(wl) do
-            if not wordScore[w] then
-                local lc = lastChar(w)
-                local bonus = atkBonus(w)
-                local ec = 0; local opLC = {}; local seenLC = {}; local tooMany = false
-                for _, v in ipairs(getDuumVariants(lc)) do
-                    if tooMany then break end
-                    local ol = dictionary[v]
-                    if ol then
-                        ec = ec + #ol
-                        for _, ow in ipairs(ol) do
-                            local o = lastChar(ow)
-                            if not seenLC[o] then
-                                seenLC[o] = true
-                                table.insert(opLC, o)
-                                if #opLC >= 20 then tooMany = true; break end
-                            end
-                        end
-                    end
-                end
-                local score
-                if ec == 0 then
-                    score = 100000 + bonus
-                elseif tooMany then
-                    score = -math.min(ec, 200) * 5 + bonus
-                else
-                    local is2K = true
-                    for _, o in ipairs(opLC) do
-                        local k = false
-                        for _, v in ipairs(getDuumVariants(o)) do
-                            if killable[v] then k = true; break end
-                        end
-                        if not k then is2K = false; break end
-                    end
-                    score = (is2K and 10000 or 0) - math.min(ec, 200) * 5 + bonus
-                end
-                wordScore[w] = score
+
+    return nil
+end
+
+-- ============================================================
+-- [ 노멀 모드: 검색 리모트로 공격 단어 찾기 ]
+-- 게임 사전 검색에는 "공격 단어" 정렬 옵션이 없어서, 여러 페이지를 긁어
+-- (스크롤해서 더 불러오는 것과 동일하게 hasMore를 따라 페이지네이션)
+-- 후보를 최대한 많이 모은 뒤, 그중 "상대가 답하기 얼마나 어려운지"를
+-- 즉석으로 계산해서 가장 공격적인 단어를 고릅니다.
+-- 점수 기준: 그 단어의 끝 글자로 시작하는 단어가 검색 리모트상 얼마나
+-- 적은지 → 적을수록(0개면 한방 단어) 상대가 막힐 확률이 높은 공격
+-- 단어로 판단합니다.
+-- ============================================================
+
+-- letter로 시작하는 단어가 몇 개나 있는지(응수 가능 단어 수)를 검색
+-- 리모트로 확인합니다. 매번 페이지네이션 전체를 긁으면 느려지므로, 첫
+-- 페이지 결과 개수 + hasMore 여부로 대략치를 빠르게 추정합니다.
+local replyCountCache = {}
+
+local function estimateReplyCount(letter)
+    local cached = replyCountCache[letter]
+    if cached ~= nil then return cached end
+    local total = 0
+    for _, s in ipairs(getDuumVariants(letter)) do
+        local words, hasMore = remoteSearchPage(s, "ganada", 0)
+        if words then
+            total = total + #words
+            if hasMore then
+                total = total + 50 -- 더 있다는 것만 확인되면 넉넉히 가산(정확한 수 불필요)
             end
         end
     end
+    replyCountCache[letter] = total
+    return total
 end
 
--- 상위 후보 중 가중치 랜덤 (패턴 방지)
-local RANDOM_TOP_N = 8
-
-local function pickFromTop(candidates, topN)
-    if #candidates == 0 then return nil end
-    topN = math.min(topN or RANDOM_TOP_N, #candidates)
-    table.sort(candidates, function(a, b) return (wordScore[a] or 0) > (wordScore[b] or 0) end)
-    local weights = {}; local totalW = 0
-    for i = 1, topN do
-        local w = math.max(1, (wordScore[candidates[i]] or 0) + 200000)
-        weights[i] = w
-        totalW = totalW + w
-    end
-    local r = math.random() * totalW
-    local cum = 0
-    for i = 1, topN do
-        cum = cum + weights[i]
-        if r <= cum then return candidates[i] end
-    end
-    return candidates[topN]
+local function clearReplyCountCache()
+    replyCountCache = {}
 end
 
--- 단어 찾기
-local function findBestWord(sc)
+local function attackScoreOf(word)
+    -- 끝 글자로 이어갈 수 있는 단어가 적을수록(=상대가 막히기 쉬울수록) 고득점
+    local lc = lastChar(word)
+    local ec = estimateReplyCount(lc)
+    if ec == 0 then
+        return 100000 -- 한방 단어(상대가 이을 단어가 아예 없음)
+    end
+    return -math.min(ec, 200) * 5
+end
+
+-- entries에서 아직 안 쓴 것들 중 공격 점수가 가장 높은 것들을 모아
+-- 그중 랜덤으로 하나 선택합니다.
+-- expectedStartChar로 실제 시작 글자가 맞는지 다시 한 번 검증합니다
+-- (검색 리모트가 요청한 글자로 시작하지 않는 단어를 섞어 줄 수 있어서).
+local function pickAttackFromEntries(entries, expectedStartChar)
+    if not entries then return nil end
+    -- 공격 점수 계산 결과 캐시 (같은 턴 안에서 중복 호출 방지)
+    local _scoreCache = {}
+    local function cachedAttackScore(w)
+        if _scoreCache[w] == nil then
+            _scoreCache[w] = attackScoreOf(w)
+        end
+        return _scoreCache[w]
+    end
+    
     local cands = {}
-    for _, v in ipairs(getDuumVariants(sc)) do
-        for _, dict in ipairs({essentialDictionary[v], attackDictionary[v], dictionary[v]}) do
-            if dict then
-                for _, w in ipairs(dict) do
-                    if not isUsed(w) and not isOpeningBlockedWord(w) and not isKkutuDisabled(w) and (wordScore[w] or 0) >= 100000 then
-                        table.insert(cands, w)
-                    end
-                end
-            end
-        end
-    end
-    return pickFromTop(cands, RANDOM_TOP_N)
-end
-
--- 노멀 모드: "더 어려운(공격적인) 단어"를 우선 선택하도록 점수 가중치를 강화해서 정렬
-local function findNormalWord(sc)
-    local cands = {}
-    for _, v in ipairs(getDuumVariants(sc)) do
-        local list = dictionary[v]
-        if list then
-            for _, w in ipairs(list) do
-                if not isUsed(w) and not wasRecent(w) and not isOpeningBlockedWord(w) and not isKkutuDisabled(w) then
-                    table.insert(cands, w)
-                end
-            end
-        end
-    end
-    if #cands == 0 then return nil end
-    -- 점수(공격성) 내림차순 정렬 후 상위권에서만 선택 = 더 어려운 단어 우선
-    table.sort(cands, function(a, b) return (wordScore[a] or 0) > (wordScore[b] or 0) end)
-    local topN = math.min(5, #cands)
-    return cands[math.random(1, topN)]
-end
-
--- 긴단어 모드: 두 시작 글자(두음 병기 포함) 후보들을 모두 비교해서 그 중 가장 긴 단어를 선택
-local function findLongestWord(sc)
-    local function collect(startChar, applyOpeningBlock)
-        local cands = {}
-        for _, v in ipairs(getDuumVariants(startChar)) do
-            local list = dictionary[v]
-            if list then
-                for _, w in ipairs(list) do
-                    if not isUsed(w) and not wasRecent(w) and not isKkutuDisabled(w) then
-                        if not applyOpeningBlock or not isOpeningBlockedWord(w) then
-                            table.insert(cands, w)
-                        end
-                    end
-                end
-            end
-        end
-        return cands
-    end
-
-    local cands = collect(sc, true)
-    if #cands == 0 then
-        cands = collect(sc, false)
-    end
-    if #cands == 0 then return nil end
-
-    local maxLen = 0
-    for _, w in ipairs(cands) do
-        local l = utf8.len(w) or #w
-        if l > maxLen then maxLen = l end
-    end
-
-    local longest = {}
-    for _, w in ipairs(cands) do
-        local l = utf8.len(w) or #w
-        if l == maxLen then table.insert(longest, w) end
-    end
-
-    -- 점수 정렬 없이, 가장 긴 글자수를 만족하는 단어들 중에서 순수하게 랜덤으로 하나 선택
-    return longest[math.random(1, #longest)]
-end
-
-local function findEasyWord(sc)
-    local cands = {}
+    local scores = {}
     local seen = {}
-    local function tryList(list)
-        if not list then return end
-        for _, w in ipairs(list) do
-            if not seen[w] and not isUsed(w) and not wasRecent(w) and not isDeleted(w) and not isKkutuDisabled(w) then
-                local s = wordScore[w] or 0
-                if s < 10000 and essentialSet[w] ~= true and attackSet[w] ~= true then
-                    seen[w] = true
-                    table.insert(cands, w)
-                end
-            end
-        end
-    end
-    for _, v in ipairs(getDuumVariants(sc)) do tryList(normalDictionary[v] or dictionary[v]) end
-    if #cands == 0 then
-        for _, v in ipairs(getDuumVariants(sc)) do
-            local list = dictionary[v]
-            if list then
-                for _, w in ipairs(list) do
-                    if not seen[w] and not isUsed(w) and not wasRecent(w) and not isDeleted(w) and not isKkutuDisabled(w) then
-                        seen[w] = true
-                        table.insert(cands, w)
-                    end
-                end
-            end
+    for _, entry in ipairs(entries) do
+        local w = type(entry) == "table" and entry.word or entry
+        if type(w) == "string" and w ~= "" and not seen[w]
+            and not isUsed(w) and not isDeleted(w)
+            and (not expectedStartChar or firstChar(w) == expectedStartChar) then
+            seen[w] = true
+            table.insert(cands, w)
+            scores[#cands] = cachedAttackScore(w)
         end
     end
     if #cands == 0 then return nil end
-    table.sort(cands, function(a, b)
-        local sa, sb = wordScore[a] or 0, wordScore[b] or 0
-        if sa ~= sb then return sa < sb end
-        return #a < #b
-    end)
-    local topN = math.min(12, #cands)
-    return cands[math.random(1, topN)]
+
+    -- 정렬 대신 상위 5개만 즉석 선택 (전체 정렬보다 빠름)
+    local topN = math.min(5, #cands)
+    local best = {}
+    for i = 1, topN do
+        local bestIdx = 1
+        for j = 2, #cands do
+            if scores[j] > (scores[bestIdx] or -999999) then
+                bestIdx = j
+            end
+        end
+        table.insert(best, cands[bestIdx])
+        table.remove(cands, bestIdx)
+        table.remove(scores, bestIdx)
+    end
+    return best[math.random(1, #best)]
 end
 
--- RACE 그래프 알고리즘 v2 데이터셋 연동판
-local raceBuilt = false
-local raceTrueCounts = false
-local raceCount = {}
-local racePools = {}
-local raceIn = {}
-local raceNodes = {}
-local raceLabelCache = nil
-local raceRankCache = nil
-local raceOutCache = {}
-local raceEdgeCache = {} -- findRaceWord()의 글자별 분류/정렬 결과 캐시 (성능 최적화)
-local raceFallbackCache = {} -- raceCandidateFallback()의 정적 후보 정렬 결과 캐시 (성능 최적화)
-local RACE_DATA_BASE = "https://gist.githubusercontent.com/GUMI2029/fecbfae5a7d44423a882002df65de3d2/raw"
-local RACE_CACHE_VERSION = "20260704_race_auto"
+-- 노멀 모드 검색 결과도 한 턴 안에서는 캐싱해서 재검색하지 않습니다.
+local function clearNormalSearchCache()
+    -- 모든 글자의 가나다순(ganada) 캐시 초기화
+    cacheWords["ganada"] = {}
+    cacheNextPage["ganada"] = {}
+    cacheExhausted["ganada"] = {}
+end
 
-local function raceLoadJSON(fileName)
-    local HttpService = game:GetService("HttpService")
-    local cacheName = "kkutu_" .. fileName:gsub("%.", "_") .. "_" .. RACE_CACHE_VERSION .. ".json"
-    if isfile and readfile and isfile(cacheName) then
-        local ok, data = pcall(function()
-            return HttpService:JSONDecode(readfile(cacheName))
-        end)
-        if ok and data then return data end
+-- 노멀 모드: 현재 로드된 페이지들에서 공격 점수 가장 높은 단어를 찾고,
+-- 없으면 다음 페이지를 한 장씩 추가로 로드하면서 반복합니다.
+local function findAttackWordFromRemote(sc)
+    local SORT = "ganada"
+    local variants = getDuumVariants(sc)
+    
+    -- 1단계: 첫 번째 변형에 대해 최소 1페이지 보장
+    local primaryVariant = variants[1]
+    ensureFirstPageLoaded(primaryVariant, SORT)
+
+    -- 2단계: 현재 캐시에서 최고 공격 단어 탐색
+    local function tryFindFromCache()
+        local words = getCurrentlyLoadedWords(primaryVariant, SORT)
+        return pickAttackFromEntries(words, primaryVariant)
     end
-    local ok, body = pcall(function()
-        return game:HttpGet(RACE_DATA_BASE .. "/" .. fileName)
-    end)
-    if ok and type(body) == "string" and #body > 10 then
-        local ok2, data = pcall(function()
-            return HttpService:JSONDecode(body)
-        end)
-        if ok2 and data then
-            pcall(function()
-                if writefile then writefile(cacheName, body) end
-            end)
-            return data
+
+    local found = tryFindFromCache()
+    if found then return found end
+
+    -- 3단계: 단어를 못 찾았으면 다음 페이지로 교체
+    local MAX_RETRY = REMOTE_SEARCH_MAX_PAGES
+    for _ = 1, MAX_RETRY do
+        if cacheExhausted[SORT] and not cacheExhausted[SORT][primaryVariant] then
+            local added = loadNextPage(primaryVariant, SORT)
+            if added > 0 then
+                found = tryFindFromCache()
+                if found then return found end
+            end
+        else
+            break
         end
     end
+
+    -- 4단계: 첫 번째 변형에서 못 찾았으면 두 번째 변형 시도
+    if #variants > 1 then
+        local altVariant = variants[2]
+        ensureFirstPageLoaded(altVariant, SORT)
+        
+        local function tryFindFromCacheAlt()
+            local words = getCurrentlyLoadedWords(altVariant, SORT)
+            return pickAttackFromEntries(words, altVariant)
+        end
+        
+        found = tryFindFromCacheAlt()
+        if found then return found end
+        
+        for _ = 1, MAX_RETRY do
+            if cacheExhausted[SORT] and not cacheExhausted[SORT][altVariant] then
+                local added = loadNextPage(altVariant, SORT)
+                if added > 0 then
+                    found = tryFindFromCacheAlt()
+                    if found then return found end
+                end
+            else
+                break
+            end
+        end
+    end
+
     return nil
 end
-
-local function raceWordStartsForPrompt(word, letter)
-    local f = firstChar(word)
-    for _, s in ipairs(getDuumVariants(letter)) do
-        if f == s then return true end
-    end
-    return false
-end
-
-local function raceBuildGraph()
-    if raceBuilt then return end
-    raceBuilt = true
-    raceCount = {}; racePools = {}; raceIn = {}; raceNodes = {}
-    raceLabelCache = nil; raceRankCache = nil; raceOutCache = {}
-    raceEdgeCache = {}; raceFallbackCache = {}
-
-    local rd = raceLoadJSON("racedata.json")
-    if rd and type(rd.counts) == "table" then
-        raceCount = rd.counts
-        racePools = rd.pools or {}
-        raceTrueCounts = true
-    else
-        for startChar, list in pairs(dictionary) do
-            for _, w in ipairs(list) do
-                if validWord(w) and not isDeleted(w) then
-                    local a = firstChar(w)
-                    local b = lastChar(w)
-                    raceCount[a] = raceCount[a] or {}
-                    raceCount[a][b] = (raceCount[a][b] or 0) + 1
-                end
-            end
-        end
-    end
-
-    local seenNode = {}
-    local function addNode(x)
-        if x and not seenNode[x] then
-            seenNode[x] = true
-            table.insert(raceNodes, x)
-        end
-    end
-    for a, row in pairs(raceCount) do
-        addNode(a)
-        for b, cnt in pairs(row) do
-            if cnt and cnt > 0 then
-                addNode(b)
-                raceIn[b] = raceIn[b] or {}
-                raceIn[b][a] = true
-            end
-        end
-    end
-    print("[RaceAuto] graph nodes=" .. tostring(#raceNodes) .. " counts=" .. (raceTrueCounts and "TRUE" or "approx"))
-end
-
-local function raceOutCapacity(letter)
-    raceBuildGraph()
-    if raceOutCache[letter] ~= nil then return raceOutCache[letter] end
-    local n = 0
-    local checked = {}
-    for _, s in ipairs(getDuumVariants(letter)) do
-        if not checked[s] then
-            checked[s] = true
-            local row = raceCount[s]
-            if row then
-                for _, cnt in pairs(row) do
-                    if cnt and cnt > 0 then n = n + cnt end
-                end
-            end
-        end
-    end
-    raceOutCache[letter] = n
-    return n
-end
-
-local function raceReplyCount(word)
-    if not word then return 0 end
-    return raceOutCapacity(lastChar(word))
-end
-
-local function raceRelabel()
-    raceBuildGraph()
-    if raceLabelCache and raceRankCache then return raceLabelCache, raceRankCache end
-    local label = {}
-    local rank = {}
-    local undec = {}
-    local q = {}
-    local head = 1
-    for _, u in ipairs(raceNodes) do
-        local out = 0
-        local row = raceCount[u]
-        if row then
-            for _, cnt in pairs(row) do
-                if cnt and cnt > 0 then out = out + 1 end
-            end
-        end
-        undec[u] = out
-        if out == 0 then
-            label[u] = "L"
-            rank[u] = 0
-            table.insert(q, u)
-        end
-    end
-    while head <= #q do
-        local y = q[head]
-        head = head + 1
-        local ins = raceIn[y]
-        if ins then
-            for x in pairs(ins) do
-                if label[x] == nil then
-                    if label[y] == "L" then
-                        label[x] = "W"
-                        rank[x] = (rank[y] or 0) + 1
-                        table.insert(q, x)
-                    else
-                        undec[x] = (undec[x] or 1) - 1
-                        if undec[x] <= 0 then
-                            label[x] = "L"
-                            rank[x] = (rank[y] or 0) + 1
-                            table.insert(q, x)
-                        end
-                    end
-                end
-            end
-        end
-    end
-    raceLabelCache = label
-    raceRankCache = rank
-    return label, rank
-end
-
-local function raceUsableWord(word, letter, ce, openingSafe)
-    if not word or isUsed(word) or wasRecent(word) or isDeleted(word) or isKkutuDisabled(word) then return false end
-    if not validWord(word) then return false end
-    if not raceWordStartsForPrompt(word, letter) then return false end
-    if ce and lastChar(word) ~= ce then return false end
-    if openingSafe and isOpeningBlockedWord(word) then return false end
-    if openingSafe and raceReplyCount(word) <= 0 then return false end
-    if openingSafe and OPENER_DEAD_START_LETTERS[firstChar(word)] then return false end
-    if openingSafe and OPENER_BAD_WORDS[word] then return false end
-    return true
-end
-
-local function raceWordForEdge(letter, cs, ce, openingSafe)
-    local prow = racePools[cs]
-    local pool = prow and prow[ce]
-    if pool then
-        for _, w in ipairs(pool) do
-            if raceUsableWord(w, letter, ce, openingSafe) then return w end
-        end
-    end
-    local list = dictionary[cs]
-    if list then
-        for _, w in ipairs(list) do
-            if raceUsableWord(w, letter, ce, openingSafe) then return w end
-        end
-    end
-    for _, s in ipairs(getDuumVariants(letter)) do
-        list = dictionary[s]
-        if list then
-            for _, w in ipairs(list) do
-                if raceUsableWord(w, letter, ce, openingSafe) then return w end
-            end
-        end
-    end
-    return nil
-end
-
-local function racePickEdgeWord(letter, edges, openingSafe)
-    for i = 1, math.min(6, #edges) do
-        local e = edges[i]
-        local w = raceWordForEdge(letter, e.cs, e.ce, openingSafe)
-        if w then
-            addRecent(w)
-            return w
-        end
-    end
-    return nil
-end
-
-local function raceCandidateFallback(letter, openingSafe)
-    -- 성능 최적화: usedWords/wasRecent처럼 매번 바뀌는 조건을 뺀 "정적" 후보
-    -- 목록(사전 스캔 + 정렬)을 글자별로 캐싱해서, 재시도 루프에서 반복 호출될
-    -- 때마다 매번 사전 전체를 다시 훑고 정렬하지 않도록 합니다.
-    local cacheKey = letter .. "|" .. tostring(openingSafe)
-    local cached = raceFallbackCache[cacheKey]
-
-    if not cached then
-        local cands = {}
-        local seen = {}
-        for _, s in ipairs(getDuumVariants(letter)) do
-            local list = dictionary[s]
-            if list then
-                for _, w in ipairs(list) do
-                    if not seen[w] then
-                        seen[w] = true
-                        -- isUsed/wasRecent는 매번 바뀌므로 여기서는 검사하지 않고
-                        -- 나머지 정적 조건만 raceUsableWord와 동일하게 체크
-                        if validWord(w) and not isDeleted(w) and not isKkutuDisabled(w)
-                            and raceWordStartsForPrompt(w, letter) then
-                            if not openingSafe or (
-                                not isOpeningBlockedWord(w)
-                                and raceReplyCount(w) > 0
-                                and not OPENER_DEAD_START_LETTERS[firstChar(w)]
-                                and not OPENER_BAD_WORDS[w]
-                            ) then
-                                table.insert(cands, w)
-                            end
-                        end
-                    end
-                end
-            end
-        end
-        table.sort(cands, function(a, b)
-            local ra, rb = raceReplyCount(a), raceReplyCount(b)
-            if ra ~= rb then return ra < rb end
-            return (wordScore[a] or 0) > (wordScore[b] or 0)
-        end)
-        cached = cands
-        raceFallbackCache[cacheKey] = cached
-    end
-
-    -- 캐싱된 정렬 목록에서 지금 시점에 실제로 쓸 수 있는(안 쓰인/최근 아님) 것만
-    -- 앞에서부터 최대 8개 모아서 그중 랜덤으로 선택
-    local usable = {}
-    for _, w in ipairs(cached) do
-        if not isUsed(w) and not wasRecent(w) then
-            table.insert(usable, w)
-            if #usable >= 8 then break end
-        end
-    end
-    if #usable == 0 then return nil end
-    local w = usable[math.random(1, #usable)]
-    if w then addRecent(w) end
-    return w
-end
-
-local function findRaceWord(letter, openingSafe)
-    raceBuildGraph()
-    local label, rank = raceRelabel()
-
-    -- 성능 최적화: 같은 글자(+openingSafe 상태)에 대한 분류/정렬 결과를
-    -- 캐싱해서, 재시도 루프에서 반복 호출될 때마다 매번 다시 계산하지
-    -- 않도록 합니다. (이게 없으면 노멀모드에서 랙이 심하게 걸림)
-    local cacheKey = letter .. "|" .. tostring(openingSafe)
-    local cached = raceEdgeCache[cacheKey]
-
-    local kill, yudo, safe, risk
-    if cached then
-        kill, yudo, safe, risk = cached.kill, cached.yudo, cached.safe, cached.risk
-    else
-        kill, yudo, safe, risk = {}, {}, {}, {}
-        local checked = {}
-
-        for _, cs in ipairs(getDuumVariants(letter)) do
-            if not checked[cs] then
-                checked[cs] = true
-                local row = raceCount[cs]
-                if row then
-                    for ce, cnt in pairs(row) do
-                        if cnt and cnt > 0 then
-                            local e = {cs = cs, ce = ce, reply = raceOutCapacity(ce), rank = rank[ce] or 999999}
-                            if openingSafe and e.reply < RACE_OPEN_MIN_OPP then
-                                -- 첫 턴: 착지 자리에 응수가 너무 적으면 후보 제외
-                            elseif (not openingSafe) and e.reply <= 0 then
-                                table.insert(kill, e)
-                            elseif label[ce] == "L" then
-                                if not openingSafe then
-                                    table.insert(yudo, e)
-                                end
-                            elseif label[ce] == "W" then
-                                table.insert(risk, e)
-                            else
-                                table.insert(safe, e)
-                            end
-                        end
-                    end
-                end
-            end
-        end
-
-        table.sort(kill, function(a, b) return a.reply < b.reply end)
-        table.sort(yudo, function(a, b)
-            if a.rank ~= b.rank then return a.rank < b.rank end
-            return a.reply < b.reply
-        end)
-        table.sort(safe, function(a, b)
-            if a.reply ~= b.reply then return a.reply < b.reply end
-            return a.ce < b.ce
-        end)
-        table.sort(risk, function(a, b)
-            if a.rank ~= b.rank then return a.rank > b.rank end
-            return a.reply < b.reply
-        end)
-
-        raceEdgeCache[cacheKey] = {kill = kill, yudo = yudo, safe = safe, risk = risk}
-    end
-
-    local w = racePickEdgeWord(letter, kill, openingSafe)
-    if w then return w end
-
-    w = racePickEdgeWord(letter, yudo, openingSafe)
-    if w then return w end
-
-    w = racePickEdgeWord(letter, safe, openingSafe)
-    if w then return w end
-
-    w = racePickEdgeWord(letter, risk, openingSafe)
-    if w then return w end
-
-    return raceCandidateFallback(letter, openingSafe)
-end
-
-task.spawn(function()
-    task.wait(0.5)
-    pcall(function()
-        raceBuildGraph()
-        raceRelabel()
-    end)
-end)
 
 -- ============================================================
 -- [ 단어 생성 진입점 ]
 -- primaryChar: TurnLetter의 주 글자
 -- altChar: 두음 병기("력(역)")의 괄호 안 글자 (없으면 nil)
 -- 두 글자 모두에서 후보를 뽑아 비교합니다:
---   - 노멀 모드: 더 어려운(점수 높은) 단어 우선
+--   - 노멀 모드: 더 어려운(공격적인) 단어 우선
 --   - 긴단어 모드: 둘 중 더 긴 단어 우선
 -- ============================================================
-local function pickBetter(mode, wordA, wordB)
-    if not wordA then return wordB end
-    if not wordB then return wordA end
-    if mode == "LONG" then
-        local la, lb = utf8.len(wordA) or #wordA, utf8.len(wordB) or #wordB
-        if la ~= lb then return la > lb and wordA or wordB end
-        return (wordScore[wordA] or 0) >= (wordScore[wordB] or 0) and wordA or wordB
-    end
-    -- 노멀(기본): 더 어려운(공격적인) 단어 우선
-    return (wordScore[wordA] or 0) >= (wordScore[wordB] or 0) and wordA or wordB
-end
-
 local function generateWordForChar(sc)
     if mode == "LONG" then
-        return findLongestWord(sc) or findNormalWord(sc) or findBestWord(sc)
+        return findLongestWordFromRemote(sc)
     end
-    local raceWord = findRaceWord(sc, isOpeningSafePhase())
-    if raceWord then return raceWord end
-    return findNormalWord(sc) or findLongestWord(sc) or findBestWord(sc)
+    -- 노멀 모드: 검색 리모트 기반 공격 단어
+    return findAttackWordFromRemote(sc)
+end
+
+local function pickBetter(curMode, wordA, wordB)
+    if not wordA then return wordB end
+    if not wordB then return wordA end
+    if curMode == "LONG" then
+        local la, lb = utf8.len(wordA) or #wordA, utf8.len(wordB) or #wordB
+        if la ~= lb then return la > lb and wordA or wordB end
+        return wordA
+    end
+    -- 노멀 모드는 이미 공격 점수순으로 골랐으므로 먼저 나온 것을 그대로 사용
+    return wordA
 end
 
 local function generateWord(primaryChar, altChar)
@@ -1124,21 +766,20 @@ end
 
 -- ============================================================
 -- [ 제출 ]
--- 노멀 모드: 1번 쏘고 0.1초 기다려서 확인, 그래도 안 바뀌면 0.001초 간격
---            으로 최대 5번까지(총 5번) 재시도합니다.
--- 긴단어 모드: 기존처럼 거부 감지 + 초고속 재시도 로직을 그대로 사용합니다.
---   1) 첫 단어를 내고 0.1초 기다려서 스코어보드 이름이 바뀌었는지 확인
---   2) 0.1초 안에 안 바뀌면(=거부) 0.001초 간격으로 최대 20번 재시도
---   3) 그래도 다 실패하면 시도했던 단어 중 19개는 다시 쓸 수 있게 풀어줌
+-- 노멀 모드: 1번 쏘고 0.01초 기다려서 확인, 그래도 안 바뀌면 0.01초 간격
+--            으로 최대 5번까지(총 5번) 재시도합니다. 실패 시 4개는 다시
+--            쓸 수 있게 풀어줍니다.
+-- 긴단어 모드: 검색 결과 중 가장 긴 단어를 1번만 제출합니다. 0.01초 후
+--             확인만 하고, 안 바뀌어도 재시도하지 않습니다. 제출한
+--             단어는 "🗑 리셋"을 누르기 전까지 계속 사용 못 하는 상태로
+--             남습니다.
 --
 -- 단어 딜레이: 최소값~최대값 사이에서 매번 무작위로 하나 골라서 그만큼
 -- 기다린 뒤 제출합니다. 최소/최대가 비어있거나 둘 다 0이면 딜레이 없이
 -- 거의 즉시 제출합니다.
 -- ============================================================
-local FIRST_CHECK_DELAY = 0.1     -- 첫 제출 후 변경 여부를 확인하는 대기시간(초)
-local MAX_SUBMIT_RETRY = 20       -- 거부됐을 때 빠르게 재시도할 최대 횟수(긴단어 모드 전용)
-local FAST_RETRY_DELAY = 0.001    -- 빠른 재시도 간격(초)
-local RESET_COUNT_ON_FAIL = 19    -- 재시도를 다 썼을 때 다시 풀어줄 단어 개수(긴단어 모드 전용)
+local FIRST_CHECK_DELAY = 0.01    -- 제출 후 변경 여부를 확인하는 대기시간(초)
+local FAST_RETRY_DELAY = 0.01     -- 노멀 모드 빠른 재시도 간격(초)
 local NORMAL_MAX_SUBMIT_RETRY = 5    -- 노멀 모드 최대 제출 횟수(1번 + 재시도 4번 = 총 5번)
 local NORMAL_RESET_COUNT_ON_FAIL = 4 -- 노멀 모드에서 5번 다 썼을 때 다시 풀어줄 단어 개수
 local wordDelayMin = 0 -- 단어 딜레이 최소값(초). 비어있거나 0이면 딜레이 없음
@@ -1159,7 +800,6 @@ local function submitWord(word, skip)
     local sent = fireSubmitWord(word)
     if not sent then return false end
     usedWords[word] = true
-    turnCounter = turnCounter + 2
     return true
 end
 
@@ -1175,8 +815,10 @@ local function doAutoInput()
             return
         end
         lastStartChar = main
+        -- 캐시는 유지! 매 턴 새로 검색하면 느려짐.
+        -- 캐시 초기화가 필요하면 WindUI "🗑 리셋" 버튼으로 수동 처리.
 
-        -- 노멀 모드: 1번 쏘고 0.1초 확인 후 안 바뀌면 최대 5번까지 재시도
+        -- 노멀 모드: 1번 쏘고 0.01초 확인 후 안 바뀌면 최대 5번까지 재시도
         if mode == "NORMAL" then
             local beforeName = getScoreboardTurnName()
             local attemptedWords = {}
@@ -1229,89 +871,17 @@ local function doAutoInput()
             return
         end
 
-        -- 긴단어 모드(및 그 외 모드): 거부 감지 + 초고속 재시도 로직
-        local beforeName = getScoreboardTurnName()
-        local attemptedWords = {}
-        local matched = false
-
-        -- 1) 첫 단어 제출 후 0.1초 대기하여 변경 여부 확인
-        local firstWord = generateWord(main, alt)
-        if firstWord then
-            table.insert(attemptedWords, firstWord)
-            submitWord(firstWord, true)
+        -- 긴단어 모드(및 그 외 모드): 검색 결과 중 가장 긴 단어를 1번만 제출.
+        -- 0.01초 후 확인만 하고, 안 바뀌어도 재시도하지 않습니다. 제출한
+        -- 단어는 submitWord()에서 이미 usedWords에 기록되므로, "🗑 리셋"
+        -- 버튼을 누르기 전까지는 계속 사용 못 하는 상태로 남습니다.
+        local word = generateWord(main, alt)
+        if word then
+            submitWord(word, true)
             task.wait(FIRST_CHECK_DELAY)
-
-            local afterName = getScoreboardTurnName()
-            if beforeName == nil or afterName == nil or afterName ~= beforeName then
-                matched = true
-            end
-        end
-
-        -- 2) 0.1초 안에 안 바뀌었으면(거부) 0.001초 간격으로 초고속 재시도
-        if not matched then
-            for attempt = 1, MAX_SUBMIT_RETRY do
-                local word = generateWord(main, alt)
-
-                if not word then
-                    break
-                end
-
-                table.insert(attemptedWords, word)
-                submitWord(word, true)
-
-                task.wait(FAST_RETRY_DELAY)
-
-                local afterName = getScoreboardTurnName()
-
-                -- 스코어보드 이름을 못 읽는 경우(구조 못 찾음)는 판정 불가 -> 성공으로 간주하고 종료
-                if beforeName == nil or afterName == nil then
-                    matched = true
-                    break
-                end
-
-                if afterName ~= beforeName then
-                    matched = true
-                    break
-                end
-                -- usedWords에 이미 표시되어 있어서 다음 generateWord는 자동으로 다른 단어를 고름
-            end
-        end
-
-        -- 재시도를 다 썼는데도 실패했으면, 시도했던 단어 중 일부(RESET_COUNT_ON_FAIL개)를
-        -- 다시 쓸 수 있게 풀어줍니다 (너무 많은 단어가 영구히 사라지는 것을 방지)
-        if not matched and #attemptedWords > 0 then
-            for i = #attemptedWords, 2, -1 do
-                local j = math.random(1, i)
-                attemptedWords[i], attemptedWords[j] = attemptedWords[j], attemptedWords[i]
-            end
-            local resetN = math.min(RESET_COUNT_ON_FAIL, #attemptedWords)
-            for i = 1, resetN do
-                usedWords[attemptedWords[i]] = nil
-            end
         end
     end)
     if not success then warn(err) end
-end
-
-
--- 단어 검색
-local currentSearchType = "START"
-local function searchWords(query)
-    local results = {}
-    if not query or query == "" then return results end
-    for _, wl in pairs(dictionary) do
-        for _, w in ipairs(wl) do
-            local match = false
-            if currentSearchType == "START" then match = w:sub(1, #query) == query
-            elseif currentSearchType == "END" then match = w:sub(-#query) == query
-            elseif currentSearchType == "CONTAIN" then match = w:find(query, 1, true) ~= nil
-            elseif currentSearchType == "ATTACK" then match = (wordScore[w] or 0) >= 100000 and w:sub(1, #query) == query
-            end
-            if match and #results < 50 then table.insert(results, w) end
-        end
-    end
-    table.sort(results, function(a, b) return (wordScore[a] or 0) > (wordScore[b] or 0) end)
-    return results
 end
 
 -- ══════════════════════════════════════
@@ -1331,33 +901,31 @@ local Window = WindUI:CreateWindow({
     Size = UDim2.fromOffset(580, 480),
     Transparent = true,
     SideBarWidth = 180,
-    HasOutline = true,
-})
-
-Window:EditOpenButton({
-    Title = "끝말잇기 봇 열기",
-    Icon = "monitor",
-    CornerRadius = UDim.new(0, 16),
-    StrokeThickness = 2,
-    Color = ColorSequence.new(Color3.fromHex("#4A90D9"), Color3.fromHex("#7B68EE")),
-    Draggable = true,
+    OpenButton = {
+        Title = "끝말잇기 봇 열기",
+        Icon = "monitor",
+        CornerRadius = UDim.new(0, 16),
+        StrokeThickness = 2,
+        Enabled = true,
+        Draggable = true,
+        Color = ColorSequence.new(Color3.fromHex("#4A90D9"), Color3.fromHex("#7B68EE")),
+    },
 })
 
 -- 탭
 local modeTab = Window:Tab({ Title = "모드", Icon = "solar:tuning-2-bold-duotone", Desc = "게임모드 · 자동대답" })
 local speedTab = Window:Tab({ Title = "속도/타이핑", Icon = "solar:keyboard-bold-duotone", Desc = "타자속도 · 전딜 · 제출 ID" })
-local searchTab = Window:Tab({ Title = "단어검색", Icon = "solar:magnifer-bold-duotone", Desc = "단어 검색 · 삭제 · 블랙리스트" })
-local etcTab = Window:Tab({ Title = "기타", Icon = "solar:widget-5-bold-duotone", Desc = "단어목록 사용 여부(ON/OFF)" })
-Window:SelectTab(1)
+local etcTab = Window:Tab({ Title = "기타", Icon = "solar:widget-5-bold-duotone", Desc = "단어 삭제 · 끄투 인정단어 ON/OFF" })
+-- Window:SelectTab(modeTab) -- 첫 번째 탭이 기본 선택됨
 
 -- 모드 탭
 modeTab:Section({ Title = "게임 모드" })
 
 modeTab:Dropdown({
     Title = "게임 모드 선택",
-    Values = {"노멀", "긴단어"},
+    Values = {"긴단어", "노멀"},
     Multi = false,
-    Default = "노멀",
+    Default = "긴단어",
     Callback = function(v)
         if v == "노멀" then mode = "NORMAL"
         elseif v == "긴단어" then mode = "LONG"
@@ -1377,18 +945,6 @@ modeTab:Toggle({
     end,
 })
 
-modeTab:Section({ Title = "루트 탐색" })
-
-modeTab:Slider({
-    Title = "최대 루트",
-    Desc = "N-kill 확장 루트 수 (많으면 랙 유발)",
-    Step = 1,
-    Value = {Min = 1, Max = 5, Default = 2},
-    Callback = function(v)
-        maxRoute = math.floor(tonumber(v) or 2)
-    end,
-})
-
 modeTab:Section({ Title = "수동 조작" })
 
 modeTab:Button({
@@ -1400,22 +956,15 @@ modeTab:Button({
 })
 
 modeTab:Button({
-    Title = "🔄 재생성",
-    Desc = "이전 글자로 다시 단어를 생성합니다",
-    Callback = function()
-        if lastStartChar then
-            local w = generateWord(lastStartChar)
-            if w then submitWord(w, false) end
-        end
-    end,
-})
-
-modeTab:Button({
     Title = "🗑 리셋",
-    Desc = "사용한 단어 기록을 초기화합니다",
+    Desc = "사용한 단어 기록과 페이지 캐시를 초기화합니다 (page 0부터 다시 로드)",
     Callback = function()
         usedWords = {}
         recentWords = {}
+        clearRemoteSearchCache()  -- 길이순(length) 캐시 초기화
+        clearNormalSearchCache()  -- 가나다순(ganada) 캐시 초기화
+        clearReplyCountCache()    -- 응수 추정 캐시 초기화
+        WindUI:Notify({Title = "🗑 리셋 완료", Content = "단어 기록 및 페이지 캐시가 초기화되었습니다", Duration = 3})
     end,
 })
 
@@ -1425,7 +974,7 @@ speedTab:Section({ Title = "제출 방식" })
 pcall(function()
     speedTab:Paragraph({
         Title = "안내",
-        Desc = "노멀 모드: 1번 쏘고 0.1초 확인, 안 바뀌면 0.001초 간격으로 최대 5번까지 재시도합니다.\n긴단어 모드: 먼저 단어를 내고 0.1초 기다려서 바뀌는지 확인합니다. 0.1초 안에 안 바뀌면(거부) 그때부터 0.001초 간격으로 최대 20번 초고속 재시도하고, 그래도 실패하면 시도했던 단어 중 19개를 다시 쓸 수 있게 풀어줍니다.",
+        Desc = "노멀 모드: 사전 검색 리모트로 여러 페이지(스크롤과 동일)를 긁어 후보를 모은 뒤, 상대가 답하기 어려운 공격 단어를 골라 1번 쏘고 0.01초 확인, 안 바뀌면 0.01초 간격으로 최대 5번까지 재시도합니다.\n긴단어 모드: 턴이 바뀔 때 사전 검색 리모트를 길이순으로 여러 페이지(스크롤과 동일) 끝까지 긁어서(1페이지만 보면 진짜 가장 긴 단어를 놓칠 수 있어서) 그중 가장 긴 단어를 골라 1번만 제출합니다. 재시도는 하지 않고, 제출한 단어는 '🗑 리셋'을 누르기 전까지 계속 사용하지 않습니다.",
     })
 end)
 
@@ -1491,41 +1040,13 @@ speedTab:Toggle({
     end,
 })
 
--- 단어검색 탭
-searchTab:Section({ Title = "검색 설정" })
+-- ══════════════════════════════════════
+-- 기타 탭: 단어 삭제, 끄투 인정단어 ON/OFF
+-- ══════════════════════════════════════
 
-searchTab:Dropdown({
-    Title = "검색 유형",
-    Values = {"시작 글자", "끝 글자", "포함", "한방 단어"},
-    Multi = false,
-    Default = "시작 글자",
-    Callback = function(v)
-        local m = {["시작 글자"]="START", ["끝 글자"]="END", ["포함"]="CONTAIN", ["한방 단어"]="ATTACK"}
-        currentSearchType = m[v] or "START"
-    end,
-})
+etcTab:Section({ Title = "단어 삭제" })
 
-searchTab:Section({ Title = "단어 검색" })
-
-searchTab:Input({
-    Title = "검색어 입력",
-    Placeholder = "글자를 입력하고 Enter를 누르세요",
-    Callback = function(text)
-        if text and #text > 0 then
-            local results = searchWords(text)
-            if #results > 0 then
-                local msg = table.concat(results, ", ", 1, math.min(#results, 15))
-                WindUI:Notify({Title = "검색 결과 (" .. #results .. "개)", Content = msg, Duration = 7})
-            else
-                WindUI:Notify({Title = "검색 결과", Content = "단어를 찾을 수 없습니다", Duration = 3})
-            end
-        end
-    end,
-})
-
-searchTab:Section({ Title = "단어 삭제" })
-
-searchTab:Input({
+etcTab:Input({
     Title = "삭제할 단어 입력",
     Placeholder = "단어를 입력하고 Enter를 누르세요",
     Callback = function(text)
@@ -1534,157 +1055,43 @@ searchTab:Input({
             if w then
                 deletedWords[w] = true
                 saveDeletedWords()
-                WindUI:Notify({Title = "단어 삭제", Content = w .. " 삭제됨 (재실행 시 적용)", Duration = 3})
+                WindUI:Notify({Title = "단어 삭제", Content = w .. " 삭제됨 (이후 검색 결과에서 제외)", Duration = 3})
             end
         end
     end,
 })
 
-searchTab:Section({ Title = "첫턴끝말 블랙리스트" })
-
-pcall(function()
-    searchTab:Paragraph({
-        Title = "설명",
-        Desc = "여기에 등록한 글자로 끝나는 단어는 내가 첫 턴(선공)일 때만 사용하지 않습니다. 중간 턴에는 정상적으로 사용합니다.",
-    })
-end)
-
-searchTab:Input({
-    Title = "블랙리스트에 추가할 끝 글자",
-    Placeholder = "예: 하  (입력 후 Enter)",
-    Callback = function(text)
-        if text and #text > 0 then
-            local ch = text:match("[가-힣]")
-            if ch then
-                addOpenerEndingBlacklist(ch)
-                WindUI:Notify({Title = "첫턴끝말 블랙리스트 추가", Content = "'" .. ch .. "'로 끝나는 단어는 이제 첫 턴에 사용하지 않습니다", Duration = 4})
-            end
-        end
-    end,
-})
-
-searchTab:Input({
-    Title = "블랙리스트에서 제거할 끝 글자",
-    Placeholder = "예: 하  (입력 후 Enter)",
-    Callback = function(text)
-        if text and #text > 0 then
-            local ch = text:match("[가-힣]")
-            if ch then
-                removeOpenerEndingBlacklist(ch)
-                WindUI:Notify({Title = "첫턴끝말 블랙리스트 제거", Content = "'" .. ch .. "' 제거됨", Duration = 3})
-            end
-        end
-    end,
-})
-
-searchTab:Button({
-    Title = "📋 현재 블랙리스트 보기",
-    Desc = "등록된 글자 목록을 알림으로 표시합니다",
-    Callback = function()
-        local list = {}
-        for ch, _ in pairs(openerEndingBlacklist) do table.insert(list, ch) end
-        table.sort(list)
-        if #list > 0 then
-            WindUI:Notify({Title = "첫턴끝말 블랙리스트 (" .. #list .. "개)", Content = table.concat(list, ", "), Duration = 6})
-        else
-            WindUI:Notify({Title = "첫턴끝말 블랙리스트", Content = "등록된 글자가 없습니다", Duration = 3})
-        end
-    end,
-})
-
--- ══════════════════════════════════════
--- 기타 탭: 끄투 단어목록 사용 여부 (하나로 묶은 ON/OFF)
--- ══════════════════════════════════════
-
-etcTab:Section({ Title = "끄투 단어목록 사용 여부" })
+etcTab:Section({ Title = "끄투 인정단어 사용 여부" })
 
 pcall(function()
     etcTab:Paragraph({
         Title = "설명",
-        Desc = "끄투 필수공격/공격/방어/단어목록 4가지를 하나로 묶어서 켜고 끕니다.\nOFF: 즉시 이 단어들을 전혀 쓸 수 없게 제외됩니다.\nON: 즉시 다시 정상적으로 사용 가능해집니다. (재로드 불필요)",
+        Desc = "검색 리모트 호출 시 injeong 파라미터에 반영됩니다.\nON: 게임이 인정(끄투 등록)한 단어만 검색합니다.\nOFF: 인정 여부와 무관하게 검색합니다.",
     })
 end)
 
 etcTab:Toggle({
-    Title = "🈳 끄투 단어목록 (필수공격/공격/방어/단어목록)",
-    Desc = "OFF로 끄면 즉시 해당 단어들을 못 쓰게 제외되고, ON으로 켜면 즉시 다시 사용 가능해집니다",
+    Title = "🈳 끄투 인정단어만 검색",
+    Desc = "OFF로 끄면 인정 여부 무관하게, ON으로 켜면 인정된 단어만 검색합니다",
     Value = true,
     Callback = function(v)
         kkutuWordsEnabled = v
+        clearRemoteSearchCache() -- injeong 파라미터가 바뀌므로 이전 검색 결과 캐시는 버림
+        clearNormalSearchCache()
+        clearReplyCountCache()
         if v then
-            WindUI:Notify({Title = "끄투 단어목록 ON", Content = "끄투 계열 단어를 다시 사용합니다", Duration = 3})
+            WindUI:Notify({Title = "끄투 인정단어 ON", Content = "인정된 단어만 검색합니다", Duration = 3})
         else
-            WindUI:Notify({Title = "끄투 단어목록 OFF", Content = "끄투 계열 단어를 즉시 제외합니다", Duration = 3})
+            WindUI:Notify({Title = "끄투 인정단어 OFF", Content = "인정 여부 무관하게 검색합니다", Duration = 3})
         end
     end,
 })
 
-
-
 -- ══════════════════════════════════════
--- 단어 로드 & 게임 루프
--- ══════════════════════════════════════
-
-local isLoadingWords = false
-
--- 사전 로드 + 점수 계산 + N-kill 확장을 한 번에 수행. 단어목록 ON/OFF 토글이나
--- 최초 실행 시 공용으로 호출합니다.
-reloadDictionary = function(notifyLabel)
-    if isLoadingWords then return end
-    isLoadingWords = true
-    local total = loadWords()
-    calcScores()
-    if maxRoute >= 3 then
-        local killable2 = {}
-        for sc, wl in pairs(dictionary) do
-            for _, w in ipairs(wl) do
-                if (wordScore[w] or 0) >= 10000 then killable2[sc] = true; break end
-            end
-        end
-        for _, wl in pairs(dictionary) do
-            for _, word in ipairs(wl) do
-                if (wordScore[word] or 0) < 10000 then
-                    local lc = lastChar(word)
-                    local opEnds = {}; local seenOLC = {}; local tooMany = false
-                    for _, v in ipairs(getDuumVariants(lc)) do
-                        if tooMany then break end
-                        local ol = dictionary[v]
-                        if ol then
-                            for _, ow in ipairs(ol) do
-                                local o = lastChar(ow)
-                                if not seenOLC[o] then
-                                    seenOLC[o] = true
-                                    table.insert(opEnds, o)
-                                    if #opEnds >= 25 then tooMany = true; break end
-                                end
-                            end
-                        end
-                    end
-                    if not tooMany and #opEnds > 0 then
-                        local ok = true
-                        for _, o in ipairs(opEnds) do
-                            local c = false
-                            for _, v in ipairs(getDuumVariants(o)) do
-                                if killable2[v] then c = true; break end
-                            end
-                            if not c then ok = false; break end
-                        end
-                        if ok then wordScore[word] = 5000 + (wordScore[word] or 0) end
-                    end
-                end
-            end
-        end
-    end
-    WindUI:Notify({Title = "✅ " .. (notifyLabel or "로드 완료"), Content = "단어 " .. total .. "개 로드 & 점수 계산 완료", Duration = 5})
-    isLoadingWords = false
-end
-
-task.spawn(function()
-    reloadDictionary("로드 완료")
-end)
-
 -- 자동답변 폴링: TurnLetter 텍스트가 이전과 달라질 때마다(=글자가 바뀌면)
 -- 자동으로 그 글자로 시작하는 단어를 입력합니다.
+-- ══════════════════════════════════════
+
 task.spawn(function()
     while true do
         task.wait(0.2)
